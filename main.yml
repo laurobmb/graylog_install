@@ -1,0 +1,162 @@
+
+---
+- hosts: graylog
+#- hosts: graylog_testes
+#  port: 22
+  vars:
+    TIMEZONE: 'America/Recife'
+  
+  vars_prompt:
+    - name: "password"
+      prompt: "Qual a senha para o usuaro 'admin'?"
+      private: yes
+      default: graylog
+    - name: "gl_ip"
+      prompt: "Qual o IP do servidor? (defaults to system IP)"
+      private: no
+    - name: "es_memory"
+      prompt: "Altere a memoria do servidor do ELASTICSEARCH (in MBs)"
+      private: no
+    - name: "gl_memory"
+      prompt: "Altere a memoria do servidor do GRAYLOG (in MBs)"
+      private: no
+
+  tasks:
+    - rpm_key:
+        state: present
+        key: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+
+    - name: Copiando repositorio elasticsearch.repo
+      copy: src=./files/elasticsearch.repo dest=/etc/yum.repos.d/     
+
+    - name: Copiando repositorio mongodb.repo
+      copy: src=./files/mongodb.repo dest=/etc/yum.repos.d/     
+
+    - name: Instalação de repositorio EPEL
+      when: ansible_distribution == 'CentOS' and ansible_distribution_version > 6 or ansible_distribution_version < 7
+      yum: name=epel-release state=latest
+
+    - name: Install GRAYLOG Repository
+      #yum: name=https://packages.graylog2.org/repo/packages/graylog-3.0-repository_latest.rpm
+      yum: name=https://packages.graylog2.org/repo/el/stable/2.4/x86_64/graylog-2.4-repository-1-6.noarch.rpm
+      ignore_errors: True
+
+    - name: Atualização do servidor
+      yum: 
+        name: '*'
+        state: latest
+
+    - name: Instalação de pacotes para o ELASTICSEARCH/MONGODB/GRAYLOG
+      yum: 
+        name:
+          - java
+          - elasticsearch
+          - python-pip
+          - vim
+          - policycoreutils-python
+          - mongodb-org
+          - graylog-server
+          - nginx
+          - pwgen
+        state: present
+
+    - name: Instalando PIP passlib
+      pip:
+        state: present
+        name: 
+          - passlib
+          - pyOpenSSL
+
+    - name: ELASTICSEARCH
+      template: src=./files/elasticsearch.yml dest=/etc/elasticsearch/elasticsearch.yml backup=yes
+
+    - name: NGINX Graylog
+      template: src=./files/graylog.conf dest=/etc/nginx/conf.d/graylog.conf backup=yes
+
+    - name: GRAYLOG V2
+      template: src=./files/server.conf.v2 dest=/etc/graylog/server/server.conf backup=yes
+
+#    - name: GRAYLOG V3
+#      template: src=./files/server.conf.v3 dest=/etc/graylog/server/server.conf backup=yes
+
+    - shell: semanage port -a -t mongod_port_t -p tcp 27017
+      ignore_errors: True
+
+    - name: "Graylog - Generate password secret"
+      command: pwgen -N 1 -s 96
+      register: password_secret
+
+    - name: "Graylog - Generate admin password hash"
+      shell: "echo -n {{ password }} | sha256sum"
+      register: sha_password
+
+    - name: "Graylog - Configure password secret"
+      replace:
+        path: /etc/graylog/server/server.conf
+        regexp: ^password_secret =$
+        replace: "password_secret = {{ password_secret.stdout }}"
+
+    - name: "Graylog - Configure admin password hash"
+      replace:
+        path: /etc/graylog/server/server.conf
+        regexp: "(?!.*{{ sha_password.stdout.split(' ')[0] }})^root_password_sha2 .+$"
+        replace: "root_password_sha2 = {{ sha_password.stdout.split(' ')[0] }}"
+
+    - name: "Elasticsearch - Configure initial heap size "
+      when: es_memory is defined
+      lineinfile:
+        path: /etc/elasticsearch/jvm.options
+        regexp: '(?!.*-Xms{{ es_memory }}m)^-Xms\d+?[gm]'
+        line: "-Xms{{ es_memory }}m"
+        state: present
+
+    - name: "Elasticsearch - Configure maximum heap size "
+      when: es_memory is defined
+      lineinfile:
+        path: /etc/elasticsearch/jvm.options
+        regexp: '(?!.*-Xmx{{ es_memory }}m)^-Xmx\d+?[gm]'
+        line: "-Xmx{{ es_memory }}m"
+        state: present
+     
+    - name: "Graylog - Configure initial memory"
+      when: gl_memory is defined
+      replace:
+        path: /etc/sysconfig/graylog-server
+        regexp: '(?!.*-Xms{{ gl_memory }}m)-Xms\d+?[gm]'
+        replace: "-Xms{{ gl_memory }}m"
+
+    - name: "Graylog - Configure maximum memory"
+      when: gl_memory is defined
+      replace:
+        path: /etc/sysconfig/graylog-server
+        regexp: '(?!.*-Xmx{{ gl_memory }}m)-Xmx\d+?[gm]'
+        replace: "-Xms{{ gl_memory }}m"
+
+    - name: "Graylog - Configure rest_listen_uri"
+      replace:
+        path: /etc/graylog/server/server.conf
+        regexp: "^(?!.*{% if gl_ip %}{{ gl_ip }}{% else %}{{ ansible_default_ipv4.address }}{% endif %})^rest_listen_uri =.+$"
+        replace: "rest_listen_uri = http://{% if gl_ip %}{{ gl_ip }}{% else %}{{ ansible_default_ipv4.address }}{% endif %}:9000/api/"
+  
+    - name: "Graylog - Configure web_listen_uri"
+      replace:
+        path: /etc/graylog/server/server.conf
+        regexp: "^(?!.*{% if gl_ip %}{{ gl_ip }}{% else %}{{ ansible_default_ipv4.address }}{% endif %})^web_listen_uri =.+$"
+        replace: "web_listen_uri = http://{% if gl_ip %}{{ gl_ip }}{% else %}{{ ansible_default_ipv4.address }}{% endif %}:9000/api/"
+
+    - htpasswd:
+        path: /etc/nginx/htpasswd.users
+        name: admin
+        password: '{{ password_secret.stdout }}'
+        owner: root
+        group: nginx
+        mode: 0640
+
+    - name: Iniciar os servicos
+      systemd: state=restarted enabled=yes name="{{ item }}"
+      with_items:
+        - elasticsearch.service
+        - mongod.service
+        - graylog-server.service
+        - nginx.service
+
